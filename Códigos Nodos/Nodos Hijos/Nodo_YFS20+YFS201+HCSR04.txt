@@ -1,0 +1,539 @@
+// main.c - NODO HIJO FLUJÓMETROS + HC-SR04 COMPATIBLE CON ROOT ACTUAL
+// ESP-IDF v6.1
+//
+// Sensores:
+// - YF-S201_A (GPIO19) -> flow_state
+// - YF-S201_B (GPIO18) -> flow_state
+// - HC-SR04 (TRIG=17 ECHO=16) -> distance
+//
+// Compatible con root actual:
+// struct msg_t:
+//   uint8_t value_type;   // 0=int, 1=float
+//   char node_name[24];
+//   char zone[24];
+//   char sensor[24];
+//   char metric[16];
+//   char unit[16];
+//   union { int32_t i; float f; } v;
+//   uint32_t timestamp;
+
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+#include <inttypes.h>
+#include <time.h>
+
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_log.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_mesh.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
+#include "esp_intr_alloc.h"
+#include "esp_err.h"
+
+/* =========================
+ * TAG
+ * ========================= */
+static const char *TAG = "Banio_FLOW_HCSR04";
+
+/* =========================
+ * IDENTIDAD DEL NODO
+ * ========================= */
+#define NODE_NAME        "Banio_nodo_2"
+#define NODE_ZONE        "Banio"
+
+/* Sensores lógicos del mismo nodo */
+#define SENSOR_NAME_YF201_A   "yf_s201_a_Banio"
+#define SENSOR_NAME_YF201_B   "yf_s201_Lavamanos"
+#define SENSOR_NAME_HCSR04    "hc_sr04_Banio"
+
+/* =========================
+ * MESH CONFIG
+ * ========================= */
+#define MESH_ID        {0x32,0x10,0x88,0x44,0x55,0x66}
+#define ROUTER_SSID    "Pdegrado24"
+#define ROUTER_PASS    "20Pgrado26$"
+#define ROUTER_CH      0
+#define MESH_AP_PASS   "v2345678"
+#define MESH_MAX_CONN  6
+
+/* =========================
+ * PROTOCOLO ROOT ACTUAL
+ * ========================= */
+typedef enum {
+    VALUE_TYPE_INT   = 0,
+    VALUE_TYPE_FLOAT = 1
+} value_type_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t value_type;
+    char node_name[24];
+    char zone[24];
+    char sensor[24];
+    char metric[16];
+    char unit[16];
+    union {
+        int32_t i;
+        float   f;
+    } v;
+    uint32_t timestamp;
+} msg_t;
+
+/* =========================
+ * PINES
+ * ========================= */
+#define YF_S201_A_GPIO       19
+#define YF_S201_B_GPIO       18
+#define HCSR04_TRIG_GPIO     17
+#define HCSR04_ECHO_GPIO     16
+
+/* =========================
+ * TIEMPOS
+ * ========================= */
+#define FLOW_WINDOW_MS         1000
+#define FLOW_PERIODIC_SEND_MS  5000
+#define HCSR04_SEND_PERIOD_MS  5000
+#define HCSR04_TIMEOUT_US      30000
+
+#define FLOW_ON_MIN_PULSES     5
+#define FLOW_OFF_TIMEOUT_MS    2000
+#define MIN_PULSE_INTERVAL_US  20000
+
+/* =========================
+ * GLOBALES FLUJÓMETROS
+ * ========================= */
+static volatile uint32_t flow_pulses_201_a = 0;
+static volatile uint32_t flow_pulses_201_b = 0;
+static volatile int64_t  last_pulse_201_a_us = 0;
+static volatile int64_t  last_pulse_201_b_us = 0;
+
+/* =====================================================
+ * HELPERS
+ * ===================================================== */
+static void safe_copy_fixed(char *dst, size_t dst_sz, const char *src)
+{
+    if (!dst || dst_sz == 0) return;
+
+    memset(dst, 0, dst_sz);
+
+    if (!src) return;
+
+    snprintf(dst, dst_sz, "%s", src);
+}
+
+static uint32_t get_timestamp_s(void)
+{
+    time_t now = time(NULL);
+
+    if ((uint32_t)now >= 1700000000UL) {
+        return (uint32_t)now;
+    }
+
+    return (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
+/* =====================================================
+ * EVENTOS WIFI / IP / MESH
+ * ===================================================== */
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base != WIFI_EVENT) return;
+
+    switch (id) {
+        case WIFI_EVENT_STA_START:
+            ESP_LOGI(TAG, "WIFI_EVENT_STA_START");
+            break;
+
+        case WIFI_EVENT_STA_CONNECTED:
+            ESP_LOGI(TAG, "WIFI_EVENT_STA_CONNECTED");
+            break;
+
+        case WIFI_EVENT_STA_DISCONNECTED:
+            ESP_LOGW(TAG, "WIFI desconectado");
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base != IP_EVENT || id != IP_EVENT_STA_GOT_IP) return;
+
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
+    ESP_LOGI(TAG, "IP obtenida " IPSTR, IP2STR(&event->ip_info.ip));
+}
+
+static void mesh_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base != MESH_EVENT) return;
+
+    switch (id) {
+        case MESH_EVENT_STARTED: {
+            mesh_addr_t myid = {0};
+            esp_mesh_get_id(&myid);
+            ESP_LOGI(TAG, "Mesh iniciado ID=%02X:%02X:%02X:%02X:%02X:%02X",
+                     myid.addr[0], myid.addr[1], myid.addr[2],
+                     myid.addr[3], myid.addr[4], myid.addr[5]);
+            break;
+        }
+
+        case MESH_EVENT_PARENT_CONNECTED:
+            ESP_LOGI(TAG, "Parent conectado | layer=%d root=%d",
+                     esp_mesh_get_layer(), esp_mesh_is_root());
+            break;
+
+        case MESH_EVENT_PARENT_DISCONNECTED:
+            ESP_LOGW(TAG, "Parent desconectado");
+            break;
+
+        default:
+            break;
+    }
+}
+
+/* =====================================================
+ * ENVÍO MESH COMPATIBLE CON ROOT
+ * ===================================================== */
+static esp_err_t mesh_send_msg(msg_t *msg)
+{
+    mesh_data_t data = {
+        .data  = (uint8_t *)msg,
+        .size  = sizeof(msg_t),
+        .proto = MESH_PROTO_BIN,
+        .tos   = MESH_TOS_P2P
+    };
+
+    return esp_mesh_send(NULL, &data, 0, NULL, 0);
+}
+
+static int mesh_send_metric_int(const char *sensor_name,
+                                const char *metric_name,
+                                const char *unit_name,
+                                int32_t value)
+{
+    if (esp_mesh_get_layer() <= 0) {
+        return -1;
+    }
+
+    msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+
+    msg.value_type = VALUE_TYPE_INT;
+
+    safe_copy_fixed(msg.node_name, sizeof(msg.node_name), NODE_NAME);
+    safe_copy_fixed(msg.zone, sizeof(msg.zone), NODE_ZONE);
+    safe_copy_fixed(msg.sensor, sizeof(msg.sensor), sensor_name);
+    safe_copy_fixed(msg.metric, sizeof(msg.metric), metric_name);
+    safe_copy_fixed(msg.unit, sizeof(msg.unit), unit_name);
+
+    msg.v.i = value;
+    msg.timestamp = get_timestamp_s();
+
+    esp_err_t err = mesh_send_msg(&msg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mesh_send INT FAIL sensor=%s metric=%s err=%s",
+                 sensor_name, metric_name, esp_err_to_name(err));
+        return -1;
+    }
+
+    return 0;
+}
+
+static int mesh_send_metric_float(const char *sensor_name,
+                                  const char *metric_name,
+                                  const char *unit_name,
+                                  float value)
+{
+    if (esp_mesh_get_layer() <= 0) {
+        return -1;
+    }
+
+    msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+
+    msg.value_type = VALUE_TYPE_FLOAT;
+
+    safe_copy_fixed(msg.node_name, sizeof(msg.node_name), NODE_NAME);
+    safe_copy_fixed(msg.zone, sizeof(msg.zone), NODE_ZONE);
+    safe_copy_fixed(msg.sensor, sizeof(msg.sensor), sensor_name);
+    safe_copy_fixed(msg.metric, sizeof(msg.metric), metric_name);
+    safe_copy_fixed(msg.unit, sizeof(msg.unit), unit_name);
+
+    msg.v.f = value;
+    msg.timestamp = get_timestamp_s();
+
+    esp_err_t err = mesh_send_msg(&msg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mesh_send FLOAT FAIL sensor=%s metric=%s err=%s",
+                 sensor_name, metric_name, esp_err_to_name(err));
+        return -1;
+    }
+
+    return 0;
+}
+
+/* =====================================================
+ * FLUJÓMETROS
+ * Conserva lógica original:
+ * - ISR por pulsos
+ * - ON/OFF por pulsos + timeout
+ * - envío inmediato al cambio
+ * - envío periódico cada 5 s
+ * ===================================================== */
+static void IRAM_ATTR flow_isr_yf201_a_handler(void *arg)
+{
+    int64_t now = esp_timer_get_time();
+    int64_t last = last_pulse_201_a_us;
+    if (last != 0 && (now - last) < MIN_PULSE_INTERVAL_US) return;
+    last_pulse_201_a_us = now;
+    flow_pulses_201_a++;
+}
+
+static void IRAM_ATTR flow_isr_yf201_b_handler(void *arg)
+{
+    int64_t now = esp_timer_get_time();
+    int64_t last = last_pulse_201_b_us;
+    if (last != 0 && (now - last) < MIN_PULSE_INTERVAL_US) return;
+    last_pulse_201_b_us = now;
+    flow_pulses_201_b++;
+}
+
+static void flow_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << YF_S201_A_GPIO) | (1ULL << YF_S201_B_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_POSEDGE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(YF_S201_A_GPIO, flow_isr_yf201_a_handler, NULL));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(YF_S201_B_GPIO, flow_isr_yf201_b_handler, NULL));
+
+    ESP_LOGI(TAG, "Flujómetros listos YF-S201_A(G%d) YF-S201_B(G%d)", YF_S201_A_GPIO, YF_S201_B_GPIO);
+}
+
+static void flow_task(void *arg)
+{
+    int last_flow_201_a = -1;
+    int last_flow_201_b = -1;
+    uint32_t elapsed_ms = 0;
+    bool first_send = true;
+
+    ESP_LOGI(TAG, "Flujómetros ON/OFF activos");
+
+    while (1) {
+        if (esp_mesh_get_layer() <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        uint32_t pulses_201_a = flow_pulses_201_a;
+        uint32_t pulses_201_b = flow_pulses_201_b;
+        flow_pulses_201_a = 0;
+        flow_pulses_201_b = 0;
+
+        int64_t now_us = esp_timer_get_time();
+        int64_t last_201_a = last_pulse_201_a_us;
+        int64_t last_201_b = last_pulse_201_b_us;
+
+        bool flow_201_a_on = false;
+        if (pulses_201_a >= (uint32_t)FLOW_ON_MIN_PULSES) {
+            flow_201_a_on = true;
+        } else if (last_201_a != 0) {
+            int64_t dt_ms = (now_us - last_201_a) / 1000;
+            flow_201_a_on = (dt_ms <= FLOW_OFF_TIMEOUT_MS);
+        }
+
+        bool flow_201_b_on = false;
+        if (pulses_201_b >= (uint32_t)FLOW_ON_MIN_PULSES) {
+            flow_201_b_on = true;
+        } else if (last_201_b != 0) {
+            int64_t dt_ms = (now_us - last_201_b) / 1000;
+            flow_201_b_on = (dt_ms <= FLOW_OFF_TIMEOUT_MS);
+        }
+
+        int state_201_a = flow_201_a_on ? 1 : 0;
+        int state_201_b = flow_201_b_on ? 1 : 0;
+
+        bool changed_201_a = (first_send || state_201_a != last_flow_201_a);
+        bool changed_201_b = (first_send || state_201_b != last_flow_201_b);
+
+        if (changed_201_a) {
+            mesh_send_metric_int(SENSOR_NAME_YF201_A, "flow_state", "bool", state_201_a);
+            ESP_LOGI(TAG, "YF-S201_A CAMBIO -> Pulsos=%" PRIu32 " FLUJO=%s",
+                     pulses_201_a, flow_201_a_on ? "ON" : "OFF");
+            last_flow_201_a = state_201_a;
+        }
+
+        if (changed_201_b) {
+            mesh_send_metric_int(SENSOR_NAME_YF201_B, "flow_state", "bool", state_201_b);
+            ESP_LOGI(TAG, "YF-S201_B CAMBIO -> Pulsos=%" PRIu32 " FLUJO=%s",
+                     pulses_201_b, flow_201_b_on ? "ON" : "OFF");
+            last_flow_201_b = state_201_b;
+        }
+
+        elapsed_ms += FLOW_WINDOW_MS;
+
+        if (elapsed_ms >= FLOW_PERIODIC_SEND_MS) {
+            mesh_send_metric_int(SENSOR_NAME_YF201_A, "flow_state", "bool", state_201_a);
+            mesh_send_metric_int(SENSOR_NAME_YF201_B, "flow_state", "bool", state_201_b);
+
+            ESP_LOGI(TAG, "YF-S201_A PERIODICO -> Pulsos=%" PRIu32 " FLUJO=%s",
+                     pulses_201_a, flow_201_a_on ? "ON" : "OFF");
+            ESP_LOGI(TAG, "YF-S201_B PERIODICO -> Pulsos=%" PRIu32 " FLUJO=%s",
+                     pulses_201_b, flow_201_b_on ? "ON" : "OFF");
+
+            elapsed_ms = 0;
+        }
+
+        first_send = false;
+
+        vTaskDelay(pdMS_TO_TICKS(FLOW_WINDOW_MS));
+    }
+}
+
+/* =====================================================
+ * HC-SR04
+ * Conserva lógica original de lectura y envío periódico
+ * ===================================================== */
+static void hcsr04_init(void)
+{
+    gpio_config_t trig_conf = {
+        .pin_bit_mask = 1ULL << HCSR04_TRIG_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&trig_conf));
+    gpio_set_level(HCSR04_TRIG_GPIO, 0);
+
+    gpio_config_t echo_conf = {
+        .pin_bit_mask = 1ULL << HCSR04_ECHO_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&echo_conf));
+
+    ESP_LOGI(TAG, "HC-SR04 listo TRIG(G%d) ECHO(G%d)", HCSR04_TRIG_GPIO, HCSR04_ECHO_GPIO);
+}
+
+static float hcsr04_read_cm(void)
+{
+    gpio_set_level(HCSR04_TRIG_GPIO, 0);
+    esp_rom_delay_us(2);
+    gpio_set_level(HCSR04_TRIG_GPIO, 1);
+    esp_rom_delay_us(10);
+    gpio_set_level(HCSR04_TRIG_GPIO, 0);
+
+    int64_t t0 = esp_timer_get_time();
+    while (gpio_get_level(HCSR04_ECHO_GPIO) == 0) {
+        if (esp_timer_get_time() - t0 > HCSR04_TIMEOUT_US) return 0.0f;
+    }
+
+    int64_t start = esp_timer_get_time();
+    while (gpio_get_level(HCSR04_ECHO_GPIO) == 1) {
+        if (esp_timer_get_time() - start > HCSR04_TIMEOUT_US) return 0.0f;
+    }
+
+    int64_t duration_us = esp_timer_get_time() - start;
+    float cm = (float)duration_us * 0.01715f;
+
+    return (cm > 400.0f) ? 0.0f : cm;
+}
+
+static void hcsr04_task(void *arg)
+{
+    ESP_LOGI(TAG, "HC-SR04 activo (cada %d ms)", HCSR04_SEND_PERIOD_MS);
+
+    while (1) {
+        if (esp_mesh_get_layer() <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        float distance_cm = hcsr04_read_cm();
+
+        mesh_send_metric_float(SENSOR_NAME_HCSR04, "distance", "cm", distance_cm);
+        ESP_LOGI(TAG, "HC-SR04: %.1f cm", (double)distance_cm);
+
+        vTaskDelay(pdMS_TO_TICKS(HCSR04_SEND_PERIOD_MS));
+    }
+}
+
+/* =====================================================
+ * app_main
+ * ===================================================== */
+void app_main(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID, &mesh_event_handler, NULL));
+
+    esp_netif_t *netif_sta = NULL;
+    esp_netif_t *netif_ap  = NULL;
+    ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&netif_sta, &netif_ap));
+
+    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_ERROR_CHECK(esp_mesh_init());
+
+    mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
+    uint8_t mid[6] = MESH_ID;
+    memcpy(cfg.mesh_id.addr, mid, 6);
+
+    cfg.channel = ROUTER_CH;
+
+    cfg.router.ssid_len = strlen(ROUTER_SSID);
+    memcpy(cfg.router.ssid, ROUTER_SSID, cfg.router.ssid_len);
+    memcpy(cfg.router.password, ROUTER_PASS, strlen(ROUTER_PASS));
+
+    cfg.mesh_ap.max_connection = MESH_MAX_CONN;
+    cfg.mesh_ap.nonmesh_max_connection = 0;
+    memcpy(cfg.mesh_ap.password, MESH_AP_PASS, strlen(MESH_AP_PASS));
+
+    ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
+    ESP_ERROR_CHECK(esp_mesh_set_self_organized(true, false));
+    ESP_ERROR_CHECK(esp_mesh_start());
+
+    flow_init();
+    hcsr04_init();
+
+    xTaskCreate(flow_task, "flow_task", 4096, NULL, 5, NULL);
+    xTaskCreate(hcsr04_task, "hcsr04_task", 4096, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "Nodo hijo FLUJÓMETROS + HC-SR04 compatible con root actual");
+    ESP_LOGI(TAG, "YF-S201_A(G19) YF-S201_B(G18) HC-SR04(TRIG17,ECHO16)");
+    ESP_LOGI(TAG, "sizeof(msg_t)=%u", (unsigned)sizeof(msg_t));
+}
