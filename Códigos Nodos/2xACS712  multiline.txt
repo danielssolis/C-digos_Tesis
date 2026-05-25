@@ -1,0 +1,415 @@
+// main.c - NODO HIJO 2xACS712 (AC RMS) COMPATIBLE CON ROOT ACTUAL
+// ESP-IDF v6.1
+//
+// ACS712 #1 -> GPIO34
+// ACS712 #2 -> GPIO35
+//
+// Compatible con root actual:
+// struct msg_t:
+//   uint8_t value_type;   // 0=int, 1=float
+//   char node_name[24];
+//   char zone[24];
+//   char sensor[24];
+//   char metric[16];
+//   char unit[16];
+//   union { int32_t i; float f; } v;
+//   uint32_t timestamp;
+
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <time.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "esp_log.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_mesh.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
+#include "esp_err.h"
+
+#include "esp_adc/adc_oneshot.h"
+
+static const char *TAG = "Cocina_ACS712x2";
+
+/* =========================
+ * IDENTIDAD DEL NODO
+ * ========================= */
+#define NODE_NAME          "Cocina_nodo_4"
+#define NODE_ZONE          "Cocina"
+#define SENSOR_NAME_ACS1   "acs712_airfryer"
+#define SENSOR_NAME_ACS2   "acs712_cafetera"
+
+/* =========================
+ * MESH CONFIG
+ * ========================= */
+#define MESH_ID        {0x32,0x10,0x88,0x44,0x55,0x66}
+#define ROUTER_SSID    "Pdegrado24"
+#define ROUTER_PASS    "20Pgrado26$"
+#define ROUTER_CH      0
+#define MESH_AP_PASS   "v2345678"
+#define MESH_MAX_CONN  6
+
+/* =========================
+ * PROTOCOLO ROOT ACTUAL
+ * ========================= */
+typedef enum {
+    VALUE_TYPE_INT   = 0,
+    VALUE_TYPE_FLOAT = 1
+} value_type_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t value_type;
+    char node_name[24];
+    char zone[24];
+    char sensor[24];
+    char metric[16];
+    char unit[16];
+    union {
+        int32_t i;
+        float   f;
+    } v;
+    uint32_t timestamp;
+} msg_t;
+
+/* =========================
+ * ACS712 CONFIG
+ * ========================= */
+#define ACS712_1_GPIO     34
+#define ACS712_2_GPIO     35
+#define ACS712_1_ADC_CH   ADC_CHANNEL_6
+#define ACS712_2_ADC_CH   ADC_CHANNEL_7
+
+#define SEND_PERIOD_MS    1000
+#define RMS_SAMPLES       500
+#define RMS_DELAY_US      200
+
+/* ACS712 30A */
+#define ACS712_VPER_AMP        0.066f
+
+/* Umbral de cero */
+#define ACS712_ZERO_A_BASE     0.03f
+#define ACS712_ZERO_A_MARGIN   0.06f
+#define ACS712_ZERO_A_MIN      0.10f
+
+typedef struct {
+    uint8_t channel_id;
+    int gpio;
+    adc_channel_t adc_channel;
+} acs712_desc_t;
+
+static const acs712_desc_t g_desc[2] __attribute__((unused)) = {
+    { .channel_id = 0, .gpio = ACS712_1_GPIO, .adc_channel = ACS712_1_ADC_CH },
+    { .channel_id = 1, .gpio = ACS712_2_GPIO, .adc_channel = ACS712_2_ADC_CH }
+};
+
+static adc_oneshot_unit_handle_t adc1_handle = NULL;
+static int   acs712_offset_mv[2] = {1650, 1650};
+static float acs712_zero_threshold_a[2] = {ACS712_ZERO_A_MIN, ACS712_ZERO_A_MIN};
+
+/* =====================================================
+ * HELPERS
+ * ===================================================== */
+static void safe_copy_fixed(char *dst, size_t dst_sz, const char *src)
+{
+    if (!dst || dst_sz == 0) return;
+    memset(dst, 0, dst_sz);
+    if (!src) return;
+    snprintf(dst, dst_sz, "%s", src);
+}
+
+static uint32_t get_timestamp_s(void)
+{
+    time_t now = time(NULL);
+
+    if ((uint32_t)now >= 1700000000UL) {
+        return (uint32_t)now;
+    }
+
+    return (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
+/* =====================================================
+ * EVENTOS WIFI / IP / MESH
+ * ===================================================== */
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base != WIFI_EVENT) return;
+
+    if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WIFI desconectado");
+    }
+}
+
+static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base != IP_EVENT || id != IP_EVENT_STA_GOT_IP) return;
+
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
+    ESP_LOGI(TAG, "IP OBTENIDA " IPSTR, IP2STR(&event->ip_info.ip));
+}
+
+static void mesh_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base != MESH_EVENT) return;
+
+    if (id == MESH_EVENT_PARENT_CONNECTED) {
+        ESP_LOGI(TAG, "Parent conectado | layer=%d root=%d",
+                 esp_mesh_get_layer(), esp_mesh_is_root());
+    } else if (id == MESH_EVENT_PARENT_DISCONNECTED) {
+        ESP_LOGW(TAG, "Parent desconectado");
+    }
+}
+
+/* =====================================================
+ * ENVÍO MESH
+ * ===================================================== */
+static esp_err_t mesh_send_msg(msg_t *msg)
+{
+    mesh_data_t data = {
+        .data  = (uint8_t *)msg,
+        .size  = sizeof(msg_t),
+        .proto = MESH_PROTO_BIN,
+        .tos   = MESH_TOS_P2P
+    };
+
+    return esp_mesh_send(NULL, &data, 0, NULL, 0);
+}
+
+static int mesh_send_current_float(const char *sensor_name, float amps)
+{
+    if (esp_mesh_get_layer() <= 0) {
+        return -1;
+    }
+
+    msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+
+    msg.value_type = VALUE_TYPE_FLOAT;
+
+    safe_copy_fixed(msg.node_name, sizeof(msg.node_name), NODE_NAME);
+    safe_copy_fixed(msg.zone, sizeof(msg.zone), NODE_ZONE);
+    safe_copy_fixed(msg.sensor, sizeof(msg.sensor), sensor_name);
+    safe_copy_fixed(msg.metric, sizeof(msg.metric), "current");
+    safe_copy_fixed(msg.unit, sizeof(msg.unit), "A");
+
+    msg.v.f = amps;
+    msg.timestamp = get_timestamp_s();
+
+    esp_err_t err = mesh_send_msg(&msg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mesh_send FAIL sensor=%s err=%s",
+                 sensor_name, esp_err_to_name(err));
+        return -1;
+    }
+
+    return 0;
+}
+
+/* =====================================================
+ * ADC / ACS712
+ * ===================================================== */
+static void acs712_init(void)
+{
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
+
+    adc_oneshot_chan_cfg_t cfg = {
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten = ADC_ATTEN_DB_12,
+    };
+
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ACS712_1_ADC_CH, &cfg));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ACS712_2_ADC_CH, &cfg));
+
+    ESP_LOGI(TAG, "ACS712x2 listo: GPIO%d(CH6) GPIO%d(CH7)", ACS712_1_GPIO, ACS712_2_GPIO);
+
+    /* Calibración de offset sin carga */
+    int sum[2] = {0, 0};
+    const int samples = 2000;
+    int adc_reading = 0;
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    for (int i = 0; i < samples; i++) {
+        if (adc_oneshot_read(adc1_handle, ACS712_1_ADC_CH, &adc_reading) == ESP_OK) {
+            sum[0] += adc_reading;
+        }
+        if (adc_oneshot_read(adc1_handle, ACS712_2_ADC_CH, &adc_reading) == ESP_OK) {
+            sum[1] += adc_reading;
+        }
+        esp_rom_delay_us(200);
+    }
+
+    for (int ch = 0; ch < 2; ch++) {
+        float v = ((float)sum[ch] / (float)samples) * 3.3f / 4095.0f;
+        acs712_offset_mv[ch] = (int)(v * 1000.0f);
+        ESP_LOGI(TAG, "Offset CH%d calibrado: %d mV", ch, acs712_offset_mv[ch]);
+    }
+
+    /* Estimar ruido RMS sin carga para fijar umbral de cero */
+    for (int ch = 0; ch < 2; ch++) {
+        const adc_channel_t adc_ch = (ch == 0) ? ACS712_1_ADC_CH : ACS712_2_ADC_CH;
+        double acc = 0.0;
+        int valid = 0;
+
+        for (int i = 0; i < 1200; i++) {
+            int raw = 0;
+            if (adc_oneshot_read(adc1_handle, adc_ch, &raw) == ESP_OK) {
+                int mv = (raw * 3300) / 4095;
+                int dv = mv - acs712_offset_mv[ch];
+                acc += (double)dv * (double)dv;
+                valid++;
+            }
+            esp_rom_delay_us(150);
+        }
+
+        float noise_a = 0.0f;
+        if (valid > 0) {
+            double noise_vrms_mv = sqrt(acc / (double)valid);
+            noise_a = (float)((noise_vrms_mv / 1000.0) / ACS712_VPER_AMP);
+        }
+
+        float zero_th = noise_a + ACS712_ZERO_A_MARGIN;
+        if (zero_th < ACS712_ZERO_A_MIN) {
+            zero_th = ACS712_ZERO_A_MIN;
+        }
+        acs712_zero_threshold_a[ch] = zero_th;
+
+        ESP_LOGI(TAG, "CH%d noise=%.3fA -> zero_threshold=%.3fA",
+                 ch, noise_a, acs712_zero_threshold_a[ch]);
+    }
+}
+
+static float acs712_read_rms_a(int channel)
+{
+    const adc_channel_t adc_channels[2] = {ACS712_1_ADC_CH, ACS712_2_ADC_CH};
+    int offset_mv = acs712_offset_mv[channel];
+    double acc = 0.0;
+    int valid = 0;
+
+    for (int i = 0; i < RMS_SAMPLES; i++) {
+        int raw = 0;
+        if (adc_oneshot_read(adc1_handle, adc_channels[channel], &raw) == ESP_OK) {
+            int mv = (raw * 3300) / 4095;
+            int dv = mv - offset_mv;
+            acc += (double)dv * (double)dv;
+            valid++;
+        }
+        esp_rom_delay_us(RMS_DELAY_US);
+    }
+
+    if (valid <= 0) {
+        return 0.0f;
+    }
+
+    double mean = acc / (double)valid;
+    double vrms_mv = sqrt(mean);
+    float irms = (float)((vrms_mv / 1000.0) / ACS712_VPER_AMP);
+
+    float zero_th = acs712_zero_threshold_a[channel];
+    if (zero_th < ACS712_ZERO_A_BASE) {
+        zero_th = ACS712_ZERO_A_BASE;
+    }
+
+    if (irms < zero_th) {
+        irms = 0.0f;
+    }
+
+    return irms;
+}
+
+/* =====================================================
+ * TASK PRINCIPAL
+ * ===================================================== */
+static void acs712_dual_task(void *arg)
+{
+    ESP_LOGI(TAG, "ACS712x2 activo (GPIO34/35)");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    while (1) {
+        if (esp_mesh_get_layer() <= 0) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        float amps1 = acs712_read_rms_a(0);
+        if (mesh_send_current_float(SENSOR_NAME_ACS1, amps1) == 0) {
+            ESP_LOGI(TAG, "ACS712-1(G34): %.3f A RMS", amps1);
+        }
+
+        float amps2 = acs712_read_rms_a(1);
+        if (mesh_send_current_float(SENSOR_NAME_ACS2, amps2) == 0) {
+            ESP_LOGI(TAG, "ACS712-2(G35): %.3f A RMS", amps2);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(SEND_PERIOD_MS));
+    }
+}
+
+/* =====================================================
+ * app_main
+ * ===================================================== */
+void app_main(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID, &mesh_event_handler, NULL));
+
+    esp_netif_t *netif_sta = NULL;
+    esp_netif_t *netif_ap  = NULL;
+    ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&netif_sta, &netif_ap));
+
+    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_ERROR_CHECK(esp_mesh_init());
+
+    mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
+    uint8_t mid[6] = MESH_ID;
+    memcpy(cfg.mesh_id.addr, mid, 6);
+
+    cfg.channel = ROUTER_CH;
+    cfg.router.ssid_len = strlen(ROUTER_SSID);
+    memcpy(cfg.router.ssid, ROUTER_SSID, cfg.router.ssid_len);
+    memcpy(cfg.router.password, ROUTER_PASS, strlen(ROUTER_PASS));
+
+    cfg.mesh_ap.max_connection = MESH_MAX_CONN;
+    cfg.mesh_ap.nonmesh_max_connection = 0;
+    memcpy(cfg.mesh_ap.password, MESH_AP_PASS, strlen(MESH_AP_PASS));
+
+    ESP_ERROR_CHECK(esp_mesh_set_config(&cfg));
+    ESP_ERROR_CHECK(esp_mesh_set_self_organized(true, false));
+    ESP_ERROR_CHECK(esp_mesh_start());
+
+    acs712_init();
+    xTaskCreate(acs712_dual_task, "acs712_dual_task", 4096, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "Nodo listo: ACS712-1(G34) ACS712-2(G35)");
+    ESP_LOGI(TAG, "sizeof(msg_t)=%u | SEND_PERIOD_MS=%d",
+             (unsigned)sizeof(msg_t), SEND_PERIOD_MS);
+}

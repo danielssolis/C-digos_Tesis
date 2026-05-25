@@ -1,0 +1,910 @@
+// main.c - NODO HIJO C1001 mmWave -> ESP-MESH (NO ROOT) COMPATIBLE CON ROOT ACTUAL
+// ESP-IDF v6.1
+//
+// - Mantiene protocolo UART DFRobot
+// - Parser robusto
+// - Fuerza SLEEP fijo
+// - Mantiene validaciones de sleepState / inBed / presence
+// - Envía métricas compatibles con el root actual
+// - Periodo corregido para sistema grande
+// - Usa metric + unit
+// - value_type: 0=int, 1=float
+
+#include <stdio.h>
+#include <string.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <time.h>
+#include <sys/time.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+#include "esp_mesh.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "esp_timer.h"
+#include "esp_err.h"
+#include "esp_random.h"
+
+/* =========================
+ * TAG
+ * ========================= */
+static const char *TAG = "C1001_Sala";
+
+/* =========================
+ * CONFIG DEL NODO
+ * ========================= */
+#define NODE_NAME        "Sala_nodo_5"
+#define NODE_ZONE        "Sala"
+#define SENSOR_NAME      "c1001_Sala"
+
+/* =========================
+ * MESH CONFIG
+ * ========================= */
+#define MESH_ID           {0x32,0x10,0x88,0x44,0x55,0x66}
+#define ROUTER_SSID       "Pdegrado24"
+#define ROUTER_PASS       "20Pgrado26$"
+#define ROUTER_CH         0
+#define MESH_AP_PASS      "v2345678"
+#define MESH_MAX_CONN     6
+
+/* =========================
+ * C1001 UART CONFIG
+ * ========================= */
+#define C1001_UART_NUM      UART_NUM_1
+#define C1001_UART_TXD      17
+#define C1001_UART_RXD      16
+#define C1001_UART_BAUDRATE 115200
+
+/* =========================
+ * TEMPORIZACIÓN
+ * ========================= */
+#define SEND_PERIOD_MS          15000
+#define METRIC_SPACING_MS       100
+#define STARTUP_JITTER_MIN_MS   1000
+#define STARTUP_JITTER_MAX_MS   5000
+
+/* =========================
+ * C1001 SLEEP STATE
+ * ========================= */
+#define C1001_SLEEP_STATE_DEEP       0
+#define C1001_SLEEP_STATE_LIGHT      1
+#define C1001_SLEEP_STATE_AWAKE      2
+#define C1001_SLEEP_STATE_NONE       3
+
+/* =========================
+ * PROTOCOLO COMPATIBLE CON ROOT ACTUAL
+ * ========================= */
+typedef enum {
+    VALUE_TYPE_INT   = 0,
+    VALUE_TYPE_FLOAT = 1
+} value_type_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t value_type;
+    char    node_name[24];
+    char    zone[24];
+    char    sensor[24];
+    char    metric[16];
+    char    unit[16];
+    union {
+        int32_t i;
+        float   f;
+    } v;
+    uint32_t timestamp;
+} msg_t;
+
+/* =========================
+ * ESTRUCTURAS C1001
+ * ========================= */
+typedef struct __attribute__((packed)) {
+    uint8_t presence;
+    uint8_t sleepState;
+    uint8_t averageRespiration;
+    uint8_t averageHeartbeat;
+    uint8_t turnoverNumber;
+    uint8_t largeBodyMove;
+    uint8_t minorBodyMove;
+    uint8_t apneaEvents;
+} c1001_sleep_composite_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  sleepQualityScore;
+    uint16_t sleepTime;
+    uint8_t  wakeDuration;
+    uint8_t  shallowSleepPercentage;
+    uint8_t  deepSleepPercentage;
+    uint8_t  timeOutOfBed;
+    uint8_t  exitCount;
+    uint8_t  turnOverCount;
+    uint8_t  averageRespiration;
+    uint8_t  averageHeartbeat;
+    uint8_t  apneaEvents;
+} c1001_sleep_statistics_t;
+
+typedef struct {
+    int presence;
+    int inBed;
+    int averageRespiration;
+    int averageHeartbeat;
+    int sleepQualityScore;
+    int sleepState;
+    int turnoverNumber;
+    int largeBodyMove;
+    int minorBodyMove;
+    int apneaEvents;
+    int valid;
+} c1001_data_t;
+
+typedef struct {
+    uint8_t con;
+    uint8_t cmd;
+    uint16_t dlen;
+    uint8_t data[64];
+} c1001_frame_t;
+
+/* =========================
+ * HELPERS GENERALES
+ * ========================= */
+static void safe_copy_fixed(char *dst, size_t dst_sz, const char *src)
+{
+    if (!dst || dst_sz == 0) return;
+    memset(dst, 0, dst_sz);
+    if (!src) return;
+    snprintf(dst, dst_sz, "%s", src);
+}
+
+static uint32_t get_timestamp_s(void)
+{
+    time_t now = time(NULL);
+
+    if ((uint32_t)now >= 1700000000UL) {
+        return (uint32_t)now;
+    }
+
+    return (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
+static void apply_startup_jitter(void)
+{
+    uint32_t span = STARTUP_JITTER_MAX_MS - STARTUP_JITTER_MIN_MS;
+    uint32_t jitter = STARTUP_JITTER_MIN_MS;
+
+    if (span > 0) {
+        jitter += (esp_random() % (span + 1));
+    }
+
+    ESP_LOGI(TAG, "Aplicando startup jitter de %lu ms", (unsigned long)jitter);
+    vTaskDelay(pdMS_TO_TICKS(jitter));
+}
+
+/* =========================
+ * HELPERS C1001 CHECKSUM
+ * ========================= */
+static uint8_t c1001_checksum_sum(uint8_t len, const uint8_t *buf)
+{
+    uint16_t s = 0;
+    for (uint8_t i = 0; i < len; i++) {
+        s += buf[i];
+    }
+    return (uint8_t)(s & 0xFF);
+}
+
+/* =========================
+ * UART PARSER ROBUSTO
+ * ========================= */
+static int g_uart_sync_errors = 0;
+
+static void c1001_uart_flush_rx(void)
+{
+    uart_flush_input(C1001_UART_NUM);
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
+
+static int c1001_read_one_frame(c1001_frame_t *out, int timeout_ms)
+{
+    uint8_t b;
+    int64_t t0 = esp_timer_get_time();
+    const int64_t tout_us = (int64_t)timeout_ms * 1000LL;
+    int junk_bytes = 0;
+
+    while (1) {
+        int r = uart_read_bytes(C1001_UART_NUM, &b, 1, pdMS_TO_TICKS(20));
+        if (r == 1) {
+            if (b == 0x53) {
+                uint8_t b2;
+                r = uart_read_bytes(C1001_UART_NUM, &b2, 1, pdMS_TO_TICKS(20));
+                if (r == 1 && b2 == 0x59) {
+                    if (junk_bytes > 0) {
+                        ESP_LOGW(TAG, "Encontrados %d bytes basura en UART antes de sincronizar", junk_bytes);
+                        g_uart_sync_errors++;
+                    }
+                    break;
+                } else {
+                    junk_bytes++;
+                }
+            } else {
+                junk_bytes++;
+            }
+        }
+
+        if ((esp_timer_get_time() - t0) > tout_us) {
+            if (junk_bytes > 0) {
+                ESP_LOGW(TAG, "TIMEOUT sync UART: %d bytes leídos sin encontrar 0x53 0x59", junk_bytes);
+                g_uart_sync_errors++;
+            }
+            return -1;
+        }
+    }
+
+    uint8_t hdr[4];
+    int rr = uart_read_bytes(C1001_UART_NUM, hdr, 4, pdMS_TO_TICKS(timeout_ms));
+    if (rr != 4) {
+        ESP_LOGW(TAG, "UART read hdr failed: got %d/4 bytes", rr);
+        return -2;
+    }
+
+    uint8_t con = hdr[0];
+    uint8_t cmd = hdr[1];
+    uint16_t dlen = ((uint16_t)hdr[2] << 8) | (uint16_t)hdr[3];
+    if (dlen > sizeof(out->data)) {
+        ESP_LOGW(TAG, "UART dlen=%d > max=%d", dlen, (int)sizeof(out->data));
+        return -3;
+    }
+
+    uint8_t payload[64 + 3];
+    int need = (int)dlen + 3;
+    rr = uart_read_bytes(C1001_UART_NUM, payload, need, pdMS_TO_TICKS(timeout_ms));
+    if (rr != need) {
+        ESP_LOGW(TAG, "UART read payload failed: got %d/%d bytes", rr, need);
+        return -4;
+    }
+
+    uint8_t ck = payload[dlen];
+    uint8_t t1 = payload[dlen + 1];
+    uint8_t t2 = payload[dlen + 2];
+
+    if (t1 != 0x54 || t2 != 0x43) {
+        ESP_LOGW(TAG, "UART tail mismatch: got 0x%02X%02X expected 0x5443", t1, t2);
+        return -5;
+    }
+
+    uint8_t sum_buf[6 + 64];
+    sum_buf[0] = 0x53;
+    sum_buf[1] = 0x59;
+    sum_buf[2] = con;
+    sum_buf[3] = cmd;
+    sum_buf[4] = (uint8_t)(dlen >> 8);
+    sum_buf[5] = (uint8_t)(dlen & 0xFF);
+    if (dlen > 0) {
+        memcpy(&sum_buf[6], payload, dlen);
+    }
+
+    uint8_t calc = c1001_checksum_sum((uint8_t)(6 + dlen), sum_buf);
+    if (calc != ck) {
+        ESP_LOGW(TAG, "UART checksum mismatch: calc=0x%02X got=0x%02X", calc, ck);
+        return -6;
+    }
+
+    out->con = con;
+    out->cmd = cmd;
+    out->dlen = dlen;
+    if (dlen > 0) {
+        memcpy(out->data, payload, dlen);
+    }
+
+    return 0;
+}
+
+static int c1001_send_cmd_wait(uint8_t con, uint8_t cmd,
+                               const uint8_t *data, uint16_t dlen,
+                               uint8_t exp_con, uint8_t exp_cmd,
+                               c1001_frame_t *resp,
+                               int retries, int timeout_ms)
+{
+    uint8_t tx[6 + 64 + 3];
+    if (dlen > 64) {
+        return -100;
+    }
+
+    tx[0] = 0x53;
+    tx[1] = 0x59;
+    tx[2] = con;
+    tx[3] = cmd;
+    tx[4] = (uint8_t)(dlen >> 8);
+    tx[5] = (uint8_t)(dlen & 0xFF);
+    if (dlen > 0 && data) {
+        memcpy(&tx[6], data, dlen);
+    }
+
+    uint8_t ck = c1001_checksum_sum((uint8_t)(6 + dlen), tx);
+    tx[6 + dlen] = ck;
+    tx[7 + dlen] = 0x54;
+    tx[8 + dlen] = 0x43;
+
+    for (int att = 0; att < retries; att++) {
+        c1001_uart_flush_rx();
+
+        uart_write_bytes(C1001_UART_NUM, (const char *)tx, (size_t)(9 + dlen));
+        vTaskDelay(pdMS_TO_TICKS(80));
+
+        int64_t t0 = esp_timer_get_time();
+        int frame_count = 0;
+        while ((esp_timer_get_time() - t0) < (int64_t)timeout_ms * 1000LL) {
+            c1001_frame_t fr;
+            int r = c1001_read_one_frame(&fr, 120);
+            if (r == 0) {
+                frame_count++;
+                if (fr.con == exp_con && fr.cmd == exp_cmd) {
+                    if (resp) {
+                        *resp = fr;
+                    }
+                    return 0;
+                }
+            }
+        }
+    }
+
+    return -1;
+}
+
+/* =========================
+ * WORK MODE C1001
+ * ========================= */
+static int c1001_get_workmode(uint8_t *mode_out)
+{
+    uint8_t q = 0x0F;
+    c1001_frame_t fr;
+    int r = c1001_send_cmd_wait(0x02, 0xA8, &q, 1, 0x02, 0xA8, &fr, 2, 400);
+    if (r != 0 || fr.dlen < 1) return -1;
+    *mode_out = fr.data[0];
+    return 0;
+}
+
+static int c1001_set_workmode_sleep(void)
+{
+    uint8_t mode = 0x02;
+    c1001_frame_t dummy;
+    int r = c1001_send_cmd_wait(0x02, 0x08, &mode, 1, 0x02, 0x08, &dummy, 2, 600);
+    (void)r;
+
+    vTaskDelay(pdMS_TO_TICKS(1200));
+
+    uint8_t now = 0x00;
+    if (c1001_get_workmode(&now) == 0 && now == 0x02) {
+        return 0;
+    }
+
+    return -1;
+}
+
+static void c1001_force_sleep_if_needed(void)
+{
+    uint8_t mode = 0x00;
+    if (c1001_get_workmode(&mode) == 0) {
+        if (mode == 0x02) {
+            ESP_LOGI(TAG, "C1001 work mode OK: SLEEP");
+            return;
+        }
+        ESP_LOGW(TAG, "C1001 work mode is 0x%02X, forcing SLEEP...", mode);
+    } else {
+        ESP_LOGW(TAG, "No se pudo leer work mode, forcing SLEEP...");
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (c1001_set_workmode_sleep() == 0) {
+            ESP_LOGI(TAG, "Sleep mode set OK");
+            return;
+        }
+        ESP_LOGW(TAG, "Sleep mode set failed try %d/3", i + 1);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+/* =========================
+ * LECTURAS C1001
+ * ========================= */
+static int c1001_get_presence(uint8_t *presence)
+{
+    uint8_t q = 0x0F;
+    c1001_frame_t fr;
+    int r = c1001_send_cmd_wait(0x80, 0x81, &q, 1, 0x80, 0x81, &fr, 2, 500);
+    if (r != 0 || fr.dlen < 1) return -1;
+    *presence = fr.data[0];
+    return 0;
+}
+
+static int c1001_get_inbed(uint8_t *inbed)
+{
+    uint8_t q = 0x0F;
+    c1001_frame_t fr;
+    int r = c1001_send_cmd_wait(0x84, 0x81, &q, 1, 0x84, 0x81, &fr, 2, 500);
+    if (r != 0 || fr.dlen < 1) return -1;
+    *inbed = fr.data[0];
+    return 0;
+}
+
+static int c1001_get_sleep_state(uint8_t *state)
+{
+    uint8_t q = 0x0F;
+    c1001_frame_t fr;
+    int r = c1001_send_cmd_wait(0x84, 0x82, &q, 1, 0x84, 0x82, &fr, 2, 500);
+    if (r != 0 || fr.dlen < 1) return -1;
+    *state = fr.data[0];
+    return 0;
+}
+
+static int c1001_get_realtime_respiration(uint8_t *resp)
+{
+    c1001_frame_t fr;
+    int r = c1001_send_cmd_wait(0x84, 0x83, NULL, 0, 0x84, 0x83, &fr, 3, 800);
+    if (r != 0 || fr.dlen < 1) return -1;
+    *resp = fr.data[0];
+    return 0;
+}
+
+static int c1001_get_realtime_heartbeat(uint8_t *heart)
+{
+    c1001_frame_t fr;
+    int r = c1001_send_cmd_wait(0x84, 0x84, NULL, 0, 0x84, 0x84, &fr, 3, 800);
+    if (r != 0 || fr.dlen < 1) return -1;
+    *heart = fr.data[0];
+    return 0;
+}
+
+static int c1001_get_sleep_composite(c1001_sleep_composite_t *out)
+{
+    uint8_t q = 0x0F;
+    c1001_frame_t fr;
+    int r = c1001_send_cmd_wait(0x84, 0x8D, &q, 1, 0x84, 0x8D, &fr, 3, 1200);
+    if (r != 0 || fr.dlen < sizeof(c1001_sleep_composite_t)) return -1;
+    memcpy(out, fr.data, sizeof(c1001_sleep_composite_t));
+    return 0;
+}
+
+static int c1001_get_sleep_statistics(c1001_sleep_statistics_t *out)
+{
+    uint8_t q = 0x0F;
+    c1001_frame_t fr;
+    int r = c1001_send_cmd_wait(0x84, 0x8F, &q, 1, 0x84, 0x8F, &fr, 3, 1500);
+    if (r != 0 || fr.dlen < sizeof(c1001_sleep_statistics_t)) return -1;
+    memcpy(out, fr.data, sizeof(c1001_sleep_statistics_t));
+    return 0;
+}
+
+/* =========================
+ * CONTADORES GLOBALES
+ * ========================= */
+static int g_consecutive_zero_presence = 0;
+static int g_read_errors_total = 0;
+
+static void c1001_read_all(c1001_data_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->valid = 0;
+
+    c1001_force_sleep_if_needed();
+
+    uint8_t pres = 0;
+    int ok_pres = (c1001_get_presence(&pres) == 0);
+    out->presence = ok_pres ? (int)pres : 0;
+
+    if (!ok_pres) {
+        ESP_LOGW(TAG, "FALLO lectura presence");
+        g_read_errors_total++;
+    }
+
+    if (out->presence == 0) {
+        g_consecutive_zero_presence++;
+    } else {
+        g_consecutive_zero_presence = 0;
+    }
+
+    uint8_t inb = 0, st = 0;
+    int ok_inb = (c1001_get_inbed(&inb) == 0);
+    int ok_st  = (c1001_get_sleep_state(&st) == 0);
+    out->inBed = ok_inb ? (int)inb : 0;
+    out->sleepState = ok_st ? (int)st : 0;
+
+    uint8_t resp_rt = 0, heart_rt = 0;
+    int ok_resp_rt = (c1001_get_realtime_respiration(&resp_rt) == 0);
+    int ok_heart_rt = (c1001_get_realtime_heartbeat(&heart_rt) == 0);
+
+    if (!ok_resp_rt) {
+        ESP_LOGW(TAG, "FALLO realtime respiration");
+    } else {
+        ESP_LOGI(TAG, "OK realtime respiration: %u", resp_rt);
+    }
+
+    if (!ok_heart_rt) {
+        ESP_LOGW(TAG, "FALLO realtime heartbeat");
+    } else {
+        ESP_LOGI(TAG, "OK realtime heartbeat: %u", heart_rt);
+    }
+
+    int using_rt_resp = (ok_resp_rt && resp_rt > 0);
+    int using_rt_heart = (ok_heart_rt && heart_rt > 0);
+
+    if (using_rt_resp) out->averageRespiration = resp_rt;
+    if (using_rt_heart) out->averageHeartbeat = heart_rt;
+
+    c1001_sleep_composite_t comp;
+    int ok_comp = (c1001_get_sleep_composite(&comp) == 0);
+    
+    if (!ok_comp) {
+        ESP_LOGW(TAG, "FALLO sleep composite");
+    } else {
+        ESP_LOGI(TAG, "OK sleep composite: turn=%u large=%u minor=%u apnea=%u resp=%u heart=%u",
+                 comp.turnoverNumber, comp.largeBodyMove, comp.minorBodyMove, 
+                 comp.apneaEvents, comp.averageRespiration, comp.averageHeartbeat);
+    }
+
+    if (ok_comp) {
+        if (!using_rt_resp && comp.averageRespiration > 0) out->averageRespiration = comp.averageRespiration;
+        if (!using_rt_heart && comp.averageHeartbeat > 0) out->averageHeartbeat = comp.averageHeartbeat;
+
+        out->turnoverNumber = comp.turnoverNumber;
+        out->largeBodyMove = comp.largeBodyMove;
+        out->minorBodyMove = comp.minorBodyMove;
+        out->apneaEvents = comp.apneaEvents;
+
+        if (!ok_pres) out->presence = comp.presence;
+        if (!ok_st) out->sleepState = comp.sleepState;
+        if (!ok_inb) out->inBed = (comp.presence ? 1 : 0);
+    }
+
+    c1001_sleep_statistics_t stats;
+    int ok_stats = (c1001_get_sleep_statistics(&stats) == 0);
+    
+    if (!ok_stats) {
+        ESP_LOGW(TAG, "FALLO sleep statistics");
+    } else {
+        ESP_LOGI(TAG, "OK sleep statistics: score=%u", stats.sleepQualityScore);
+    }
+
+    if (ok_stats && stats.sleepQualityScore > 0) {
+        out->sleepQualityScore = stats.sleepQualityScore;
+    }
+
+    // Si no hay presencia, los valores de respiración y pulsaciones deben ser 0
+    // (el composite devuelve datos en caché que no son válidos sin presencia)
+    if (out->presence == 0) {
+        out->averageRespiration = 0;
+        out->averageHeartbeat = 0;
+        out->largeBodyMove = 0;
+        out->minorBodyMove = 0;
+    }
+
+    // Si no está en cama, también resetear respiración, pulsaciones y movimientos
+    if (out->inBed == 0) {
+        out->averageRespiration = 0;
+        out->averageHeartbeat = 0;
+        out->largeBodyMove = 0;
+        out->minorBodyMove = 0;
+    }
+
+    out->valid = (ok_pres && (ok_inb || ok_comp)) ? 1 : 0;
+}
+
+/* =========================
+ * ENVÍO MESH COMPATIBLE CON ROOT
+ * ========================= */
+static esp_err_t mesh_send_msg(msg_t *msg)
+{
+    mesh_data_t data = {
+        .data  = (uint8_t *)msg,
+        .size  = sizeof(msg_t),
+        .proto = MESH_PROTO_BIN,
+        .tos   = MESH_TOS_P2P
+    };
+
+    return esp_mesh_send(NULL, &data, 0, NULL, 0);
+}
+
+static int mesh_send_metric_int(const char *metric_name, const char *unit_name, int32_t value)
+{
+    if (esp_mesh_get_layer() <= 0) {
+        ESP_LOGW(TAG, "Sin layer mesh para metric=%s", metric_name);
+        return -1;
+    }
+
+    msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+
+    msg.value_type = VALUE_TYPE_INT;
+
+    safe_copy_fixed(msg.node_name, sizeof(msg.node_name), NODE_NAME);
+    safe_copy_fixed(msg.zone, sizeof(msg.zone), NODE_ZONE);
+    safe_copy_fixed(msg.sensor, sizeof(msg.sensor), SENSOR_NAME);
+    safe_copy_fixed(msg.metric, sizeof(msg.metric), metric_name);
+    safe_copy_fixed(msg.unit, sizeof(msg.unit), unit_name);
+
+    msg.v.i = value;
+    msg.timestamp = get_timestamp_s();
+
+    esp_err_t err = mesh_send_msg(&msg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mesh_send INT FAIL metric=%s err=%s", metric_name, esp_err_to_name(err));
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "TX INT metric=%s unit=%s val=%" PRId32 " ts=%" PRIu32,
+             metric_name, unit_name, value, msg.timestamp);
+    return 0;
+}
+
+/* =========================
+ * DETECCIÓN DE DATOS PEGADOS
+ * ========================= */
+typedef struct {
+    int last_presence;
+    int last_inBed;
+    int last_resp;
+    int last_heart;
+    int last_state;
+    int repeat_count;
+} c1001_state_history_t;
+
+static c1001_state_history_t history = {-1, -1, -1, -1, -1, 0};
+
+static void c1001_check_stuck_state(c1001_data_t *d)
+{
+    if (d->presence == history.last_presence &&
+        d->inBed == history.last_inBed &&
+        d->averageRespiration == history.last_resp &&
+        d->averageHeartbeat == history.last_heart &&
+        d->sleepState == history.last_state) {
+
+        history.repeat_count++;
+
+        if (history.repeat_count == 24) {
+            ESP_LOGE(TAG, "CRÍTICO: Datos pegados x%d lecturas. Forzando reset lógico del sensor.",
+                     history.repeat_count);
+            c1001_force_sleep_if_needed();
+            history.repeat_count = 0;
+        }
+    } else {
+        history.repeat_count = 0;
+        history.last_presence = d->presence;
+        history.last_inBed = d->inBed;
+        history.last_resp = d->averageRespiration;
+        history.last_heart = d->averageHeartbeat;
+        history.last_state = d->sleepState;
+    }
+}
+
+/* =========================
+ * EVENTOS WIFI / IP / MESH
+ * ========================= */
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base != WIFI_EVENT) return;
+
+    switch (id) {
+        case WIFI_EVENT_STA_START:
+            ESP_LOGI(TAG, "WIFI_EVENT_STA_START");
+            break;
+        case WIFI_EVENT_STA_CONNECTED:
+            ESP_LOGI(TAG, "WIFI_EVENT_STA_CONNECTED");
+            break;
+        case WIFI_EVENT_STA_DISCONNECTED:
+            ESP_LOGW(TAG, "WIFI_EVENT_STA_DISCONNECTED");
+            esp_wifi_connect();
+            break;
+        default:
+            break;
+    }
+}
+
+static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base != IP_EVENT || id != IP_EVENT_STA_GOT_IP) return;
+
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
+    ESP_LOGI(TAG, "HIJO IP OBTENIDA " IPSTR, IP2STR(&event->ip_info.ip));
+}
+
+static void mesh_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base != MESH_EVENT) return;
+
+    switch (id) {
+        case MESH_EVENT_STARTED: {
+            mesh_addr_t myid = {0};
+            esp_mesh_get_id(&myid);
+            ESP_LOGI(TAG, "Mesh iniciado ID=%02X:%02X:%02X:%02X:%02X:%02X",
+                     myid.addr[0], myid.addr[1], myid.addr[2],
+                     myid.addr[3], myid.addr[4], myid.addr[5]);
+            break;
+        }
+
+        case MESH_EVENT_PARENT_CONNECTED: {
+            mesh_addr_t parent;
+            if (esp_mesh_get_parent_bssid(&parent) == ESP_OK) {
+                ESP_LOGI(TAG, "Parent conectado %02X:%02X:%02X:%02X:%02X:%02X layer=%d",
+                         parent.addr[0], parent.addr[1], parent.addr[2],
+                         parent.addr[3], parent.addr[4], parent.addr[5],
+                         esp_mesh_get_layer());
+            } else {
+                ESP_LOGI(TAG, "Parent conectado layer=%d", esp_mesh_get_layer());
+            }
+            break;
+        }
+
+        case MESH_EVENT_PARENT_DISCONNECTED:
+            ESP_LOGW(TAG, "Parent desconectado layer=%d", esp_mesh_get_layer());
+            break;
+
+        default:
+            break;
+    }
+}
+
+/* =========================
+ * TASK PRINCIPAL C1001
+ * ========================= */
+static void c1001_task(void *arg)
+{
+    while (esp_mesh_get_layer() <= 0) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    apply_startup_jitter();
+
+    mesh_addr_t my_mac;
+    esp_mesh_get_id(&my_mac);
+    ESP_LOGI(TAG, "Nodo C1001 listo MAC=%02X:%02X:%02X:%02X:%02X:%02X layer=%d root=%d UART%d",
+             my_mac.addr[0], my_mac.addr[1], my_mac.addr[2],
+             my_mac.addr[3], my_mac.addr[4], my_mac.addr[5],
+             esp_mesh_get_layer(), esp_mesh_is_root(), C1001_UART_NUM);
+
+    c1001_data_t d;
+    int send_count = 0;
+
+    while (1) {
+        if (esp_mesh_get_layer() <= 0) {
+            ESP_LOGW(TAG, "Sin layer, esperando reconexion");
+            while (esp_mesh_get_layer() <= 0) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            ESP_LOGI(TAG, "Reconectado a mesh layer=%d", esp_mesh_get_layer());
+        }
+
+        c1001_read_all(&d);
+        c1001_check_stuck_state(&d);
+
+        if (!d.valid) {
+            ESP_LOGW(TAG, "Lectura C1001 invalida, saltando envio");
+            vTaskDelay(pdMS_TO_TICKS(SEND_PERIOD_MS));
+            continue;
+        }
+
+        int ok = 0;
+
+        ok += (mesh_send_metric_int("presence", "bool", d.presence) == 0) ? 1 : 0;
+        vTaskDelay(pdMS_TO_TICKS(METRIC_SPACING_MS));
+
+        ok += (mesh_send_metric_int("in_bed", "bool", d.inBed) == 0) ? 1 : 0;
+        vTaskDelay(pdMS_TO_TICKS(METRIC_SPACING_MS));
+
+        ok += (mesh_send_metric_int("respiration_rpm", "rpm", d.averageRespiration) == 0) ? 1 : 0;
+        vTaskDelay(pdMS_TO_TICKS(METRIC_SPACING_MS));
+
+        ok += (mesh_send_metric_int("heartbeat_bpm", "bpm", d.averageHeartbeat) == 0) ? 1 : 0;
+        vTaskDelay(pdMS_TO_TICKS(METRIC_SPACING_MS));
+
+        ok += (mesh_send_metric_int("sleep_quality_score", "score", d.sleepQualityScore) == 0) ? 1 : 0;
+        vTaskDelay(pdMS_TO_TICKS(METRIC_SPACING_MS));
+
+        ok += (mesh_send_metric_int("sleep_state", "state", d.sleepState) == 0) ? 1 : 0;
+        vTaskDelay(pdMS_TO_TICKS(METRIC_SPACING_MS));
+
+        ok += (mesh_send_metric_int("turnover_count", "count", d.turnoverNumber) == 0) ? 1 : 0;
+        vTaskDelay(pdMS_TO_TICKS(METRIC_SPACING_MS));
+
+        ok += (mesh_send_metric_int("large_body_move_count", "count", d.largeBodyMove) == 0) ? 1 : 0;
+        vTaskDelay(pdMS_TO_TICKS(METRIC_SPACING_MS));
+
+        ok += (mesh_send_metric_int("minor_body_move_count", "count", d.minorBodyMove) == 0) ? 1 : 0;
+        vTaskDelay(pdMS_TO_TICKS(METRIC_SPACING_MS));
+
+        ok += (mesh_send_metric_int("apnea_events", "count", d.apneaEvents) == 0) ? 1 : 0;
+
+        const char *sleepStateStr =
+            (d.sleepState == C1001_SLEEP_STATE_DEEP)  ? "DEEP"  :
+            (d.sleepState == C1001_SLEEP_STATE_LIGHT) ? "LIGHT" :
+            (d.sleepState == C1001_SLEEP_STATE_AWAKE) ? "AWAKE" :
+            (d.sleepState == C1001_SLEEP_STATE_NONE)  ? "NONE"  : "UNKNOWN";
+
+        ESP_LOGI(TAG,
+                 "TX #%d C1001: presence=%d inBed=%d state=%d(%s) resp=%d heart=%d score=%d turn=%d large=%d minor=%d apnea=%d sent=%d/10",
+                 ++send_count,
+                 d.presence, d.inBed, d.sleepState, sleepStateStr,
+                 d.averageRespiration, d.averageHeartbeat, d.sleepQualityScore,
+                 d.turnoverNumber, d.largeBodyMove, d.minorBodyMove, d.apneaEvents,
+                 ok);
+
+        if (ok < 10) {
+            ESP_LOGW(TAG, "No todas las metricas se enviaron correctamente: %d/10", ok);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(SEND_PERIOD_MS));
+    }
+}
+
+/* =========================
+ * APP MAIN
+ * ========================= */
+void app_main(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(MESH_EVENT, ESP_EVENT_ANY_ID, &mesh_event_handler, NULL));
+
+    esp_netif_t *netif_sta = NULL;
+    esp_netif_t *netif_ap = NULL;
+    ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&netif_sta, &netif_ap));
+
+    wifi_init_config_t wifi_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_ERROR_CHECK(esp_mesh_init());
+
+    mesh_cfg_t mc = MESH_INIT_CONFIG_DEFAULT();
+    uint8_t mid[6] = MESH_ID;
+    memcpy(mc.mesh_id.addr, mid, 6);
+
+    mc.channel = ROUTER_CH;
+
+    mc.router.ssid_len = strlen(ROUTER_SSID);
+    memcpy(mc.router.ssid, ROUTER_SSID, mc.router.ssid_len);
+    memcpy(mc.router.password, ROUTER_PASS, strlen(ROUTER_PASS));
+
+    mc.mesh_ap.max_connection = MESH_MAX_CONN;
+    mc.mesh_ap.nonmesh_max_connection = 0;
+    memcpy(mc.mesh_ap.password, MESH_AP_PASS, strlen(MESH_AP_PASS));
+
+    ESP_ERROR_CHECK(esp_mesh_set_config(&mc));
+    ESP_ERROR_CHECK(esp_mesh_set_self_organized(true, false)); // NO ROOT
+    ESP_ERROR_CHECK(esp_mesh_start());
+
+    ESP_LOGI(TAG, "Nodo C1001 compatible con root actual iniciado. NO ROOT.");
+    ESP_LOGI(TAG, "sizeof(msg_t)=%u | SEND_PERIOD_MS=%d | METRIC_SPACING_MS=%d",
+             (unsigned)sizeof(msg_t), SEND_PERIOD_MS, METRIC_SPACING_MS);
+
+    const uart_config_t uart_config = {
+        .baud_rate = C1001_UART_BAUDRATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+
+    ESP_ERROR_CHECK(uart_param_config(C1001_UART_NUM, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(C1001_UART_NUM, C1001_UART_TXD, C1001_UART_RXD,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_ERROR_CHECK(uart_driver_install(C1001_UART_NUM, 2048, 2048, 0, NULL, 0));
+
+    xTaskCreate(c1001_task, "c1001_task", 8192, NULL, 5, NULL);
+}
